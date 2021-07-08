@@ -1,3 +1,4 @@
+#include "Backend/DashHashTable.h"
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -6,60 +7,132 @@
 #include <iostream>
 #include <nlohmann/json.hpp>
 #include <set>
+#include <string>
 #include <unordered_map>
 #include <vector>
+
+#define STACK_SIZE 1000
 
 using namespace std;
 using json = nlohmann::json;
 
-class dict
+// stack for storing labels
+char *labelStack[STACK_SIZE];
+uint32_t stackCount = 0;
+
+void pushStack(char *newLabel)
 {
-public:
-    unordered_map<uint64_t, unordered_map<uint64_t, uint64_t>> base;
-    ~dict()
+    stackCount++;
+    if (stackCount < STACK_SIZE)
     {
-        char *tfn = getenv("MARKOV_FILE");
-        string fileName;
-        if (tfn != nullptr)
+        labelStack[stackCount] = newLabel;
+    }
+}
+
+char *popStack()
+{
+    char *pop = labelStack[stackCount];
+    stackCount--;
+    return pop;
+}
+
+// Indicates which block was the caller of the current context
+int64_t openIndicator = -1;
+// holds the count of all blocks in the bitcode source file
+uint64_t totalBlocks;
+// Circular buffer of the previous MARKOV_ORDER blocks seen
+uint64_t b[MARKOV_ORDER];
+// counter that is used to index the circular buffer. The index (increment%MARKOV_ORDER) always point to the oldest entry in the buffer (after it is fully initialized)
+uint8_t increment;
+// Flag indicating whether the program is actively being profiled
+bool markovActive = false;
+// Hash table for the edges of the control flow graph
+__TA_HashTable *edgeHashTable;
+// Hash table for the labels of each basic block
+__TA_HashTable *labelHashTable;
+// Hash table for the caller-callee hash table
+__TA_HashTable *callerHashTable;
+// Global structure that is used to increment the last seen edge in the hash table
+__TA_element nextEdge;
+__TA_element nextLabel;
+__TA_element nextCallee;
+
+extern "C"
+{
+    void MarkovInit(uint64_t blockCount, uint64_t ID)
+    {
+        // edge circular buffer initialization
+        // this initialization stage lasts until MARKOV_ORDER+1 blocks have been seen
+        increment = 0;
+        b[0] = ID;
+
+        // edge hash table
+        edgeHashTable = (__TA_HashTable *)malloc(sizeof(__TA_HashTable));
+        edgeHashTable->size = (uint32_t)(ceil(log((double)blockCount) / log(2.0)));
+        edgeHashTable->getFullSize = __TA_getFullSize;
+        edgeHashTable->array = (__TA_arrayElem *)malloc(edgeHashTable->getFullSize(edgeHashTable) * sizeof(__TA_arrayElem));
+        // label hash table
+        labelHashTable = (__TA_HashTable *)malloc(sizeof(__TA_HashTable));
+        labelHashTable->size = (uint32_t)(ceil(log((double)blockCount) / log(2.0)));
+        labelHashTable->getFullSize = __TA_getFullSize;
+        labelHashTable->array = (__TA_arrayElem *)malloc(labelHashTable->getFullSize(labelHashTable) * sizeof(__TA_arrayElem));
+        // caller hash table
+        callerHashTable = (__TA_HashTable *)malloc(sizeof(__TA_HashTable));
+        callerHashTable->size = (uint32_t)(ceil(log((double)blockCount) / log(2.0)));
+        callerHashTable->getFullSize = __TA_getFullSize;
+        callerHashTable->array = (__TA_arrayElem *)malloc(callerHashTable->getFullSize(callerHashTable) * sizeof(__TA_arrayElem));
+
+        totalBlocks = blockCount;
+        markovActive = true;
+    }
+    void MarkovDestroy()
+    {
+        // print profile bin file
+        __TA_WriteEdgeHashTable(edgeHashTable, (uint32_t)totalBlocks);
+        free(edgeHashTable->array);
+        free(edgeHashTable);
+
+        // construct BlockInfo json output
+        json labelMap;
+        for (uint32_t i = 0; i < labelHashTable->getFullSize(labelHashTable); i++)
         {
-            fileName = tfn;
-        }
-        else
-        {
-            fileName = "markov.bin";
-        }
-        ofstream fp(fileName, std::ios::out | std::ios::binary);
-        for (auto addr1 : base)
-        {
-            fp.write((const char *)&addr1.first, sizeof(uint64_t));
-            uint64_t length = addr1.second.size();
-            fp.write((const char *)&length, sizeof(std::size_t));
-            for (auto addr2 : addr1.second)
+            for (uint32_t j = 0; j < labelHashTable->array[i].popCount; j++)
             {
-                fp.write((const char *)&addr2.first, sizeof(uint64_t));
-                fp.write((const char *)&addr2.second, sizeof(std::size_t));
+                auto entry = labelHashTable->array[i].tuple[j];
+                char label[100];
+                sprintf(label, "%d", entry.label.blocks[0]);
+                labelMap[string(label)]["Labels"] = map<string, uint64_t>();
             }
         }
-        fp.close();
-    }
-};
-
-long openIndicator = -1;
-map<string, set<uint64_t>> blockCallers;
-
-struct labelMap
-{
-    map<string, map<string, uint64_t>> blockLabels;
-    ~labelMap()
-    {
-        json labelMap;
-        for (const auto &bbid : blockLabels)
+        for (uint32_t i = 0; i < callerHashTable->getFullSize(callerHashTable); i++)
         {
-            labelMap[bbid.first]["Labels"] = bbid.second;
+            for (uint32_t j = 0; j < callerHashTable->array[i].popCount; j++)
+            {
+                auto entry = callerHashTable->array[i].tuple[j];
+                char label[100];
+                sprintf(label, "%d", entry.label.blocks[0]);
+                labelMap[string(label)]["BlockCallers"] = vector<string>();
+            }
         }
-        for (const auto &bbid : blockCallers)
+        for (uint32_t i = 0; i < labelHashTable->getFullSize(labelHashTable); i++)
         {
-            labelMap[bbid.first]["BlockCallers"] = bbid.second;
+            for (uint32_t j = 0; j < labelHashTable->array[i].popCount; j++)
+            {
+                auto entry = labelHashTable->array[i].tuple[j];
+                char label[100];
+                sprintf(label, "%d", entry.label.blocks[0]);
+                labelMap[string(label)]["Labels"][string(entry.label.label)] = entry.label.frequency;
+            }
+        }
+        for (uint32_t i = 0; i < callerHashTable->getFullSize(callerHashTable); i++)
+        {
+            for (uint32_t j = 0; j < callerHashTable->array[i].popCount; j++)
+            {
+                auto entry = callerHashTable->array[i].tuple[j];
+                char label[100];
+                sprintf(label, "%d", entry.label.blocks[0]);
+                labelMap[string(label)]["BlockCallers"].push_back(entry.callee.blocks[1]);
+            }
         }
         ofstream file;
         char *labelFileName = getenv("BLOCK_FILE");
@@ -72,54 +145,63 @@ struct labelMap
             file.open(labelFileName);
         }
         file << setw(4) << labelMap;
+
+        // free everything
         file.close();
+        free(labelHashTable->array);
+        free(labelHashTable);
+        free(callerHashTable->array);
+        free(callerHashTable);
+        markovActive = false;
     }
-};
-
-uint64_t b;
-uint64_t *markovResult;
-bool markovInit = false;
-dict TraceAtlasMarkovMap;
-labelMap TraceAtlasLabelMap;
-vector<char *> labelList;
-
-extern "C"
-{
-    extern uint64_t MarkovBlockCount;
     void MarkovIncrement(uint64_t a)
     {
-        if (markovInit)
+        if (markovActive)
         {
-            // this segfaults in GSL/GSL_projects_L/fft project, when processing MarkovIncrement(i64 399) (fails on the first try, preceded by 391,392,393 loop)
-            // TraceAtlasMarkovMap is definitely not null at this point (shown by gdb)
-            // the line that fails is in libSTL, its when two keys are being compared as equal, x = 398, y=<error reading variable>
-            TraceAtlasMarkovMap.base[b][a]++;
-        }
-        else
-        {
-            markovInit = true;
-        }
-        b = a;
-        if (!labelList.empty())
-        {
-            string labelName(labelList.back());
-            if (TraceAtlasLabelMap.blockLabels.find(to_string(a)) == TraceAtlasLabelMap.blockLabels.end())
+            // edge hash table
+            for (uint8_t i = 0; i < MARKOV_ORDER; i++)
             {
-                TraceAtlasLabelMap.blockLabels[to_string(a)] = map<string, uint64_t>();
-                blockCallers[to_string(a)] = set<uint64_t>();
+                // nextEdge.blocks must always be in chronological order. Thus we start from the beginning with that index (which is what the offset calculation is for)
+                nextEdge.edge.blocks[i] = (uint32_t)b[(increment + i) % MARKOV_ORDER];
             }
-            if (TraceAtlasLabelMap.blockLabels[to_string(a)].find(labelName) == TraceAtlasLabelMap.blockLabels[to_string(a)].end())
+            nextEdge.edge.blocks[MARKOV_ORDER] = (uint32_t)a;
+            while (__TA_HashTable_increment(edgeHashTable, &nextEdge))
             {
-                TraceAtlasLabelMap.blockLabels[to_string(a)][labelName] = 0;
+                cout << "Resolving clash in edge table" << endl;
+                __TA_resolveClash(edgeHashTable, edgeHashTable->size + 1);
             }
-            TraceAtlasLabelMap.blockLabels[to_string(a)][labelName]++;
+
+            // label hash table
+            if (stackCount > 0)
+            {
+                nextLabel.label.blocks[0] = (uint32_t)a;
+                // here we use the LSB of the label pointer to help hash more effectively
+                nextLabel.label.blocks[1] = (uint64_t)labelStack[stackCount] & 0xFFFF;
+                nextLabel.label.label = labelStack[stackCount];
+                while (__TA_HashTable_increment(labelHashTable, &nextLabel))
+                {
+                    cout << "Resolving clash in label table" << endl;
+                    __TA_resolveClash(labelHashTable, labelHashTable->size + 1);
+                }
+            }
+
+            // caller hash table
+            // mark our block caller, if necessary
+            if (openIndicator != -1)
+            {
+                nextCallee.callee.blocks[0] = (uint32_t)openIndicator;
+                nextCallee.callee.blocks[1] = (uint32_t)a;
+                while (__TA_HashTable_increment(callerHashTable, &nextCallee))
+                {
+                    cout << "Resolving clash in caller table" << endl;
+                    __TA_resolveClash(callerHashTable, callerHashTable->size + 1);
+                }
+            }
+            openIndicator = (int64_t)a;
+
+            b[increment % MARKOV_ORDER] = a;
+            increment++;
         }
-        // mark our block caller, if necessary
-        if (openIndicator != -1)
-        {
-            blockCallers[to_string(openIndicator)].insert(a);
-        }
-        openIndicator = (long)a;
     }
     void MarkovExit()
     {
@@ -127,10 +209,10 @@ extern "C"
     }
     void TraceAtlasMarkovKernelEnter(char *label)
     {
-        labelList.push_back(label);
+        pushStack(label);
     }
     void TraceAtlasMarkovKernelExit()
     {
-        labelList.pop_back();
+        popStack();
     }
 }

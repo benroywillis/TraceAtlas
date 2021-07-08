@@ -16,7 +16,181 @@ using json = nlohmann::json;
 cl::opt<string> InputFilename("i", cl::desc("Specify bin file"), cl::value_desc(".bin filename"), cl::Required);
 cl::opt<string> BitcodeFileName("b", cl::desc("Specify bitcode file"), cl::value_desc(".bc filename"), cl::Required);
 cl::opt<string> BlockInfoFilename("bi", cl::desc("Specify BlockInfo.json file"), cl::value_desc(".json filename"), cl::Required);
+cl::opt<string> DotFile("d", cl::desc("Specify dot filename"), cl::value_desc("dot file"));
 cl::opt<string> OutputFilename("o", cl::desc("Specify output json"), cl::value_desc("kernel filename"), cl::Required);
+
+void ProfileBlock(BasicBlock *BB, map<int64_t, map<string, uint64_t>> &rMap, map<int64_t, map<string, uint64_t>> &cpMap)
+{
+    int64_t id = GetBlockID(BB);
+    for (auto bi = BB->begin(); bi != BB->end(); bi++)
+    {
+        auto *i = cast<Instruction>(bi);
+        if (i->getMetadata("TikSynthetic") != nullptr)
+        {
+            continue;
+        }
+        //start with the opcodes
+        string name = string(i->getOpcodeName());
+        rMap[id][name + "Count"]++;
+        //now check the type
+        Type *t = i->getType();
+        if (t->isVoidTy())
+        {
+            rMap[id]["typeVoid"]++;
+            cpMap[id][name + "typeVoid"]++;
+        }
+        else if (t->isFloatingPointTy())
+        {
+            rMap[id]["typeFloat"]++;
+            cpMap[id][name + "typeFloat"]++;
+        }
+        else if (t->isIntegerTy())
+        {
+            rMap[id]["typeInt"]++;
+            cpMap[id][name + "typeInt"]++;
+        }
+        else if (t->isArrayTy())
+        {
+            rMap[id]["typeArray"]++;
+            cpMap[id][name + "typeArray"]++;
+        }
+        else if (t->isVectorTy())
+        {
+            rMap[id]["typeVector"]++;
+            cpMap[id][name + "typeVector"]++;
+        }
+        else if (t->isPointerTy())
+        {
+            rMap[id]["typePointer"]++;
+            cpMap[id][name + "typePointer"]++;
+        }
+        else
+        {
+            std::string str;
+            llvm::raw_string_ostream rso(str);
+            t->print(rso);
+            cerr << "Unrecognized type: " + str + "\n";
+        }
+        rMap[id]["instructionCount"]++;
+        cpMap[id]["instructionCount"]++;
+    }
+}
+
+map<string, map<string, map<string, int>>> ProfileKernels(const std::map<string, std::set<int64_t>> &kernels, Module *M, std::map<int64_t, uint64_t> &blockCounts)
+{
+    map<int64_t, map<string, uint64_t>> rMap;  //dictionary which keeps track of the actual information per block
+    map<int64_t, map<string, uint64_t>> cpMap; //dictionary which keeps track of the cross product information per block
+    //start by profiling every basic block
+    for (auto &F : *M)
+    {
+        for (Function::iterator BB = F.begin(), E = F.end(); BB != E; ++BB)
+        {
+            ProfileBlock(cast<BasicBlock>(BB), rMap, cpMap);
+        }
+    }
+
+    // maps kernel ID to type of pi to instruction type to instruction count
+    map<string, map<string, map<string, int>>> fin;
+
+    map<string, map<string, int>> cPigData;  //from the trace
+    map<string, map<string, int>> pigData;   //from the bitcode
+    map<string, map<string, int>> ecPigData; //cross product from the trace
+    map<string, map<string, int>> epigData;  //cross product from the bitcode
+
+    for (const auto &kernel : kernels)
+    {
+        string iString = kernel.first;
+        auto blocks = kernel.second;
+        for (auto block : blocks)
+        {
+            // frequency count of this block
+            uint64_t count = blockCounts[block];
+            for (const auto &pair : rMap[block])
+            {
+                cPigData[iString][pair.first] += pair.second * count;
+                pigData[iString][pair.first] += pair.second;
+            }
+
+            for (const auto &pair : cpMap[block])
+            {
+                ecPigData[iString][pair.first] += pair.second * count;
+                epigData[iString][pair.first] += pair.second;
+            }
+        }
+    }
+
+    // now do kernel ID wise mapping
+    for (const auto &kernelID : pigData)
+    {
+        fin[kernelID.first]["Pig"] = kernelID.second;
+    }
+    for (const auto &kernelID : cPigData)
+    {
+        fin[kernelID.first]["CPig"] = kernelID.second;
+    }
+    for (const auto &kernelID : epigData)
+    {
+        fin[kernelID.first]["EPig"] = kernelID.second;
+    }
+    for (const auto &kernelID : ecPigData)
+    {
+        fin[kernelID.first]["ECPig"] = kernelID.second;
+    }
+    return fin;
+}
+
+string GenerateDot(const set<GraphNode *, p_GNCompare> &nodes, const set<Kernel *, KCompare> &kernels)
+{
+    string dotString = "digraph{\n";
+    /*int j = 0;
+    // here we build the kernel group clusters
+    for (const auto &kernel : kernels)
+    {
+        dotString += "\tsubgraph cluster_" + to_string(j) + "{\n";
+        dotString += "\t\tlabel=\"Kernel " + to_string(j++) + "\";\n";
+        for (auto b : kernel->getBlocks())
+        {
+            dotString += "\t\t" + to_string(b) + ";\n";
+        }
+        dotString += "\t}\n";
+    }*/
+    // label kernels
+    for (const auto &kernel : kernels)
+    {
+        dotString += "\t" + to_string(kernel->virtualNode->NID) + " [label=\"" + kernel->Label + "\"]\n";
+    }
+    // now build out the nodes in the graph
+    for (const auto &node : nodes)
+    {
+        for (const auto &n : node->neighbors)
+        {
+            dotString += "\t" + to_string(node->NID) + " -> " + to_string(n.first) + ";\n";
+        }
+        if (auto VKN = dynamic_cast<VKNode *>(node))
+        {
+            for (const auto &p : VKN->kernel->parentKernels)
+            {
+                dotString += "\t" + to_string(node->NID) + " -> " + to_string(p) + " [style=dashed];\n";
+            }
+        }
+        /*for (auto bi = block->begin(); bi != block->end(); bi++)
+        {
+            if (auto *ci = dyn_cast<CallInst>(bi))
+            {
+                auto *F = ci->getCalledFunction();
+                if (F != nullptr && !F->empty())
+                {
+                    BasicBlock *entry = &F->getEntryBlock();
+                    auto id = GetBlockID(entry);
+                    dotString += "\t" + to_string(b) + " -> " + to_string(id) + " [style=dashed];\n";
+                }
+            }
+        }*/
+    }
+    dotString += "}";
+
+    return dotString;
+}
 
 void AddNode(std::set<GraphNode *, p_GNCompare> &nodes, const GraphNode &newNode)
 {
@@ -77,67 +251,93 @@ void RemoveNode(std::set<GraphNode *, p_GNCompare> &CFG, GraphNode *removeNode)
         }
     }*/
     // fourth, free
-    CFG.erase(removeNode);
-    delete removeNode;
+    auto entry = CFG.find(removeNode->NID);
+    if (entry != CFG.end())
+    {
+        CFG.erase(entry);
+        delete removeNode;
+    }
 }
 
 void RemoveNode(std::set<GraphNode *, p_GNCompare> &CFG, const GraphNode &removeNode)
 {
     // fourth, free
-    CFG.erase(CFG.find(removeNode.NID));
+    auto entry = CFG.find(removeNode.NID);
+    if (entry != CFG.end())
+    {
+        CFG.erase(CFG.find(removeNode.NID));
+        delete *entry;
+    }
 }
 
-void ReadBIN(std::set<GraphNode *, p_GNCompare> &nodes, const std::string &filename, bool print = false)
+// this function is only written to support MARKOV_ORDER=1 (TODO: generalize source,sink reading)
+int ReadBIN(std::set<GraphNode *, p_GNCompare> &nodes, const std::string &filename, bool print = false)
 {
-    std::fstream inputFile;
-    inputFile.open(filename, std::ios::in | std::ios::binary);
-    if (!inputFile.good())
+    // first initialize the graph to all the blocks in the
+    FILE *f = fopen(filename.data(), "rb");
+    if (!f)
     {
-        spdlog::critical("Could not open input file " + filename + " for reading.");
-        return;
+        return 1;
     }
-    while (inputFile.peek() != EOF)
+    // first word is a uint32_t of the markov order of the graph
+    uint32_t markovOrder;
+    fread(&markovOrder, sizeof(uint32_t), 1, f);
+    // second word is a uint32_t of the total number of blocks in the graph (each block may or may not be connected to the rest of the graph)
+    uint32_t blocks;
+    fread(&blocks, sizeof(uint32_t), 1, f);
+    for (uint32_t i = 0; i < blocks; i++)
     {
-        // New block description: BBID,#ofNeighbors (16 bytes per neighbor)
-        uint64_t key;
-        inputFile.readsome((char *)&key, sizeof(uint64_t));
-        GraphNode currentNode;
-        if (nodes.find(key) == nodes.end())
-        {
-            currentNode = GraphNode(key);
-            // when reading the trace file, NID and blockID are 1to1
-            currentNode.blocks[(int64_t)key] = (int64_t)key;
-        }
-        else
-        {
-            spdlog::error("Found a BBID that already existed in the graph!");
-        }
-        // the instance count of the edge
-        uint64_t count;
-        // for summing the total count of the neighbors
-        uint64_t sum = 0;
-        inputFile.readsome((char *)&count, sizeof(uint64_t));
-        for (uint64_t i = 0; i < count; i++)
-        {
-            uint64_t k2;
-            inputFile.readsome((char *)&k2, sizeof(uint64_t));
-            uint64_t val;
-            inputFile.readsome((char *)&val, sizeof(uint64_t));
-            if (val > 0)
-            {
-                sum += val;
-                currentNode.neighbors[k2] = std::pair(val, 0.0);
-            }
-        }
-        for (auto &key : currentNode.neighbors)
-        {
-            key.second.second = (double)key.second.first / (double)sum;
-        }
-        AddNode(nodes, currentNode);
+        auto newNode = GraphNode(i);
+        newNode.blocks.insert((int64_t)i);
+        AddNode(nodes, newNode);
     }
-    inputFile.close();
+    // third word is a uint32_t of how many edges there are in the file
+    uint32_t edges;
+    fread(&edges, sizeof(uint32_t), 1, f);
 
-    // now fill in all the predecessor nodes
+    // read all the edges
+    // for now, only works when MARKOV_ORDER=1
+    uint32_t source = 0;
+    uint32_t sink = 0;
+    uint64_t frequency = 0;
+    // the __TA_element union contains 2 additional words for blockLabel char*
+    uint64_t garbage = 0;
+    for (uint32_t i = 0; i < edges; i++)
+    {
+        fread(&source, sizeof(uint32_t), 1, f);
+        fread(&sink, sizeof(uint32_t), 1, f);
+        fread(&frequency, sizeof(uint64_t), 1, f);
+        fread(&garbage, sizeof(uint64_t), 1, f);
+
+        auto nodeIt = nodes.find(source);
+        if (nodeIt == nodes.end())
+        {
+            throw AtlasException("Found a node described in an edge that does not exist in the BBID space!");
+        }
+
+        if ((*nodeIt)->neighbors.find((uint64_t)sink) != (*nodeIt)->neighbors.end())
+        {
+            throw AtlasException("Found a sink node that is already a neighbor of this source node!");
+        }
+        (*nodeIt)->neighbors[(uint64_t)sink].first = frequency;
+    }
+    fclose(f);
+
+    // calculate all the edge probabilities
+    for (auto &node : nodes)
+    {
+        uint64_t sum = 0;
+        for (const auto &successor : node->neighbors)
+        {
+            sum += successor.second.first;
+        }
+        for (auto &successor : node->neighbors)
+        {
+            successor.second.second = (double)successor.second.first / (double)sum;
+        }
+    }
+
+    // fill in all the predecessor nodes
     for (auto &node : nodes)
     {
         for (const auto &neighbor : node->neighbors)
@@ -147,17 +347,31 @@ void ReadBIN(std::set<GraphNode *, p_GNCompare> &nodes, const std::string &filen
             {
                 (*successorNode)->predecessors.insert(node->NID);
             }
-            // the trace doesn't include the terminating block of the program (because it has no edges leading from it)
-            // But this creates a problem when defining kernel exits, so look for the node who has a neighbor that is not in the set already and add that neighbor (with correct predecessor)
+            // the profile doesn't include the terminating block of the program (because it has no edges leading from it)
+            // But this creates a problem when defining kernel exits, so look for the node who has a neighbor that is not in the graph already and add that neighbor (with correct predecessor)
             else
             {
                 // we likely found the terminating block, so add the block and assign the current node to be its predecessor
                 auto programTerminator = GraphNode(neighbor.first);
-                programTerminator.blocks[(int64_t)programTerminator.NID] = (int64_t)programTerminator.NID;
                 programTerminator.predecessors.insert(node->NID);
                 AddNode(nodes, programTerminator);
             }
         }
+    }
+
+    // finally, look for all nodes with no predecessors and no successors and remove them (they slow down the transform algorithms)
+    vector<GraphNode *> toRemove;
+    for (auto &node : nodes)
+    {
+        auto nodeObject = *node;
+        if (nodeObject.predecessors.empty() && nodeObject.neighbors.empty())
+        {
+            toRemove.push_back(node);
+        }
+    }
+    for (const auto &r : toRemove)
+    {
+        RemoveNode(nodes, r);
     }
 
     if (print)
@@ -182,6 +396,7 @@ void ReadBIN(std::set<GraphNode *, p_GNCompare> &nodes, const std::string &filen
             std::cout << std::endl;
         }
     }
+    return 0;
 }
 
 /// Returns true if one or more cycles exist in the graph specified by nodes, false otherwise
@@ -273,8 +488,7 @@ void TrivialTransforms(std::set<GraphNode *, p_GNCompare> &nodes, std::map<int64
                         auto sinkBlock = IDToBlock[(int64_t)(*succ)->NID];
                         if (sourceBlock == nullptr || sinkBlock == nullptr)
                         {
-                            spdlog::error("Found a node in the graph whose ID did not map to a basic block pointer in the ID map!");
-                            break;
+                            throw AtlasException("Found a node in the graph whose ID did not map to a basic block pointer in the ID map!");
                         }
                         if (sourceBlock->getParent() == sinkBlock->getParent())
                         {
@@ -290,6 +504,10 @@ void TrivialTransforms(std::set<GraphNode *, p_GNCompare> &nodes, std::map<int64
                                     currentNode->neighbors[n.first] = n.second;
                                     (*succ2)->predecessors.erase((*succ)->NID);
                                     (*succ2)->predecessors.insert(currentNode->NID);
+                                }
+                                else
+                                {
+                                    throw AtlasException("Successor missing from control flow graph!");
                                 }
                             }
                             // add the successor blocks
@@ -310,7 +528,7 @@ void TrivialTransforms(std::set<GraphNode *, p_GNCompare> &nodes, std::map<int64
                 }
                 else
                 {
-                    break;
+                    throw AtlasException("Successor missing from control flow graph!");
                 }
             }
             else
@@ -356,7 +574,7 @@ void BranchToSelectTransforms(std::set<GraphNode *, p_GNCompare> &nodes)
             // 1.) 0-deep branch->select: entrance can go directly to exit
             // 2.) 1-deep branch->select: entrance cannot go directly to exit
             // holds all neighbors of all midnodes
-            std::set<uint64_t> midNodeTargets;
+            std::set<uint64_t> midNodeSuccessors;
             for (const auto &midNode : entrance->neighbors)
             {
                 midNodes.insert(midNode.first);
@@ -364,18 +582,17 @@ void BranchToSelectTransforms(std::set<GraphNode *, p_GNCompare> &nodes)
                 {
                     for (const auto &neighbor : (*nodes.find(midNode.first))->neighbors)
                     {
-                        midNodeTargets.insert(neighbor.first);
+                        midNodeSuccessors.insert(neighbor.first);
                     }
                 }
                 else
                 {
-                    // ensures that all our midnodes can be found
-                    break;
+                    throw AtlasException("Found a midnode that is not in the control flow graph!");
                 }
             }
-            if (midNodeTargets.size() == 1) // corner case where the exit of the subgraph has no successors (it is the last node to execute in the program). In this case we have to check if the entrance is a predecessor of the lone midNodeTarget
+            if (midNodeSuccessors.size() == 1) // corner case where the exit of the subgraph has no successors (it is the last node to execute in the program). In this case we have to check if the entrance is a predecessor of the lone midNodeTarget
             {
-                auto cornerCase = nodes.find(*midNodeTargets.begin());
+                auto cornerCase = nodes.find(*midNodeSuccessors.begin());
                 if (cornerCase != nodes.end())
                 {
                     if ((*cornerCase)->predecessors.find(entrance->NID) != (*cornerCase)->predecessors.end())
@@ -389,8 +606,12 @@ void BranchToSelectTransforms(std::set<GraphNode *, p_GNCompare> &nodes)
                     {
                         // we have confirmed case 2: all entrance successors lead to a common exit, meaning the entrance cannot lead directly to the exit
                         MergeCase = true;
-                        potentialExit = nodes.find(*midNodeTargets.begin());
+                        potentialExit = nodes.find(*midNodeSuccessors.begin());
                     }
+                }
+                else
+                {
+                    throw AtlasException("Could not find midNode in control flow graph!");
                 }
                 if (potentialExit == nodes.end())
                 {
@@ -422,6 +643,10 @@ void BranchToSelectTransforms(std::set<GraphNode *, p_GNCompare> &nodes)
                                         common = false;
                                     }
                                 }
+                            }
+                            else
+                            {
+                                throw AtlasException("Neighbor not found in control flow graph!");
                             }
                         }
                         if (common)
@@ -468,7 +693,7 @@ void BranchToSelectTransforms(std::set<GraphNode *, p_GNCompare> &nodes)
                 }
                 else
                 {
-                    badCondition = true;
+                    throw AtlasException("Missing midnode from the control flow graph!");
                 }
             }
             if (badCondition)
@@ -489,7 +714,7 @@ void BranchToSelectTransforms(std::set<GraphNode *, p_GNCompare> &nodes)
                 }
                 else
                 {
-                    badCondition = true;
+                    throw AtlasException("Missing midnode from the control flow graph!");
                 }
             }
             if (badCondition)
@@ -497,7 +722,8 @@ void BranchToSelectTransforms(std::set<GraphNode *, p_GNCompare> &nodes)
                 break;
             }
             // 4.) potentialExit can only have the midnodes as predecessors
-            tmpMids = midNodes;
+            // BW [5/31/21] This is a case specific check and is done later
+            /*tmpMids = midNodes;
             badCondition = false;
             for (auto &pred : (*potentialExit)->predecessors)
             {
@@ -510,7 +736,7 @@ void BranchToSelectTransforms(std::set<GraphNode *, p_GNCompare> &nodes)
             if (badCondition)
             {
                 break;
-            }
+            }*/
             // 5.) potentialExit can't have the entrance or any midnodes as successors
             tmpMids = midNodes;
             badCondition = false; // flipped if we find a midnode or entrance in potentialExit successors, or we find a bad node
@@ -553,7 +779,7 @@ void BranchToSelectTransforms(std::set<GraphNode *, p_GNCompare> &nodes)
             // Now we do case-specific checks
             if (MergeCase)
             {
-                // case 2: all entrance neighbors have a common successor
+                // case 2: the entrance cannot lead directly to the exit
                 // 2 conditions must be checked
                 // 1.) entrance only has midnodes as successors
                 tmpMids = midNodes;
@@ -578,7 +804,7 @@ void BranchToSelectTransforms(std::set<GraphNode *, p_GNCompare> &nodes)
             }
             else
             {
-                // case 1: all entrance neighbors have a common successor, and the entrance is a predecessor of that successor
+                // case 1: the entrance can lead directly to the exit
                 // 2 conditions must be checked
                 // 1.) entrance only has midnodes and potentialExit as successors
                 tmpMids = midNodes;
@@ -595,7 +821,7 @@ void BranchToSelectTransforms(std::set<GraphNode *, p_GNCompare> &nodes)
                 auto tmpPreds = (*potentialExit)->predecessors;
                 tmpMids = midNodes;
                 tmpMids.insert(entrance->NID);
-                for (auto &n : (*potentialExit)->predecessors)
+                for (auto &n : tmpMids)
                 {
                     tmpPreds.erase(n);
                 }
@@ -617,6 +843,10 @@ void BranchToSelectTransforms(std::set<GraphNode *, p_GNCompare> &nodes)
                     (*succ2)->predecessors.erase((*potentialExit)->NID);
                     (*succ2)->predecessors.insert(entrance->NID);
                 }
+                else
+                {
+                    throw AtlasException("Missing successor from the control flow graph!");
+                }
             }
             // merge midNodes and potentialExit blocks in order
             for (auto n : midNodes)
@@ -625,6 +855,10 @@ void BranchToSelectTransforms(std::set<GraphNode *, p_GNCompare> &nodes)
                 if (midNode != nodes.end())
                 {
                     entrance->addBlocks((*midNode)->blocks);
+                }
+                else
+                {
+                    throw AtlasException("Missing midNode from the control flow graph!");
                 }
             }
             entrance->addBlocks((*potentialExit)->blocks);
@@ -636,6 +870,10 @@ void BranchToSelectTransforms(std::set<GraphNode *, p_GNCompare> &nodes)
                 if (midNode != nodes.end())
                 {
                     nodes.erase(*midNode);
+                }
+                else
+                {
+                    throw AtlasException("Missing midNode from the control flow graph!");
                 }
             }
             RemoveNode(nodes, *potentialExit);
@@ -763,7 +1001,7 @@ void FanInFanOutTransform(std::set<GraphNode *, p_GNCompare> &nodes)
                         {
                             if (nodes.find(neighbor.first) == nodes.end())
                             {
-                                spdlog::error("Found a neighbor that does not exist within the graph!");
+                                throw AtlasException("Found a neighbor that does not exist within the graph!");
                             }
                             Q.push_back(*nodes.find(neighbor.first));
                         }
@@ -815,8 +1053,7 @@ void FanInFanOutTransform(std::set<GraphNode *, p_GNCompare> &nodes)
                     auto neighbor = *nodes.find(nei.first);
                     if (nodes.find(nei.first) == nodes.end())
                     {
-                        spdlog::error("Found a neighbor that does not exist in the graph!");
-                        continue;
+                        throw AtlasException("Found a neighbor that does not exist in the graph!");
                     }
                     neighbor->predecessors.erase(sink->NID);
                     neighbor->predecessors.insert(source->NID);
@@ -835,69 +1072,106 @@ std::vector<Kernel *> VirtualizeKernels(std::set<Kernel *, KCompare> &newKernels
     vector<Kernel *> newPointers;
     for (const auto &kernel : newKernels)
     {
-        // gather entrance and exit nodes
-        auto kernelEntrances = kernel->getEntrances();
-        auto kernelExits = kernel->getExits();
         try
         {
-            if ((kernelEntrances.size() == 1) && (kernelExits.size() == 1))
+            // gather entrance and exit nodes
+            auto kernelEntrances = kernel->getEntrances(nodes);
+            auto kernelExits = kernel->getExits(nodes);
+            if (kernelEntrances.empty() || kernelExits.empty())
             {
-                // change the neighbors of the entrance node to the exit node (because the exit nodes are the first blocks outside the kernel exit edges)
-                auto entranceNode = new VKNode(*kernelEntrances.begin(), kernel);
-                // remove each node in the kernel that are possibly in the node predecessors
-                for (const auto &node : kernel->nodes)
+                continue;
+            }
+            // steps
+            // first: select a node to become the VKNode (for now this is just the entrance at the front of the list) and remove all predecessors of the kernel entrance that are within the kernel itself (virtual kernel nodes are not allowed to loop onto themselves)
+            // second: for each entrance, change the neighbor of each predecessor with the VKnode (this draws the existing edges from predecessor to kernel entrance - to the new VKNode)
+            // third: collect all edges that lead out the kernel, and add all these edges to the VKnode neighbors (this draws existing edges from the new VKNode to its exit nodes)
+            // fourth: remove all nodes within the kernel except any virtual kernels within this kernel (this deletes everything old in the graph, leaving only the new virtual kernel behind, but spares the child kernels which float in free space. They are used later to establish parent-child relationships)
+
+            auto kernelNode = new VKNode(**kernelEntrances.begin(), kernel);
+            // remove each node in the kernel that are possibly in the entrance predecessors
+            // this removes all edges in the graph that can lead to the kernel other than the kernel entrance predecessors
+            for (const auto &node : kernel->nodes)
+            {
+                kernelNode->predecessors.erase(node.NID);
+            }
+
+            // for each entrance, fix the neighbors of each predecessor
+            //  - make new neighbor pointing to the VKnode (this will duplicate the neighbor for the original entrance node)
+            //  - add this predecessor to the predecessors of the VKnode
+            for (const auto &ent : kernelEntrances)
+            {
+                for (const auto &predID : ent->predecessors)
                 {
-                    entranceNode->predecessors.erase(node.NID);
+                    auto pred = nodes.find(predID);
+                    if (pred != nodes.end()) // sanity check
+                    {
+                        if (kernel->nodes.find(predID) == kernel->nodes.end()) // if this predecessor of the entrance is not a member of the kernel, proceed
+                        {
+                            (*pred)->neighbors[kernelNode->NID] = (*pred)->neighbors[ent->NID];
+                            (*pred)->neighbors.erase(ent->NID);
+                            kernelNode->predecessors.insert(predID);
+                        }
+                    }
+                    else
+                    {
+                        throw AtlasException("Node predecessor not found in the control flow graph!");
+                    }
                 }
-                auto exitNode = *(kernelExits.begin());
-                // investigate the neighbors
+            }
+
+            // for each exit, fix its predecessors
+            //  - remove the original kernel node from the predecessors
+            //  - add the VKnode to the predecessors
+            kernelNode->neighbors.clear();
+            for (const auto &exitNode : kernelExits)
+            {
                 // the only edges leading from the virtual kernel node should be edges out of the kernel
-                // we are given the nodes within the kernel that have neighbors outside the kernel, so here we figure out which exit edges exist
+                // we are given the nodes inside the kernel that have successors outside the kernel, so here we figure out which exit edges from our exit node leave the kernel
                 // we leave the probabilities the same as the original nodes (this means we will have outgoing edges whose probabilities do not sum to 1, because edges that go back in the kernel are omitted)
-                entranceNode->neighbors.clear();
-                for (const auto &en : exitNode.neighbors)
+                for (const auto &en : exitNode->neighbors)
                 {
                     // nodes within the kernel will not be in the neighbors of the virtual kernel
                     if (kernel->nodes.find(en.first) == kernel->nodes.end())
                     {
-                        if (kernel->nodes.find(en.first) == kernel->nodes.end())
+                        auto exitNeighbor = nodes.find(en.first);
+                        if (exitNeighbor != nodes.end())
                         {
-                            auto exitNode = nodes.find(en.first);
-                            if (exitNode != nodes.end())
-                            {
-                                entranceNode->neighbors[en.first] = en.second;
-                            }
+                            kernelNode->neighbors[en.first] = en.second;
+                            (*exitNeighbor)->predecessors.erase(exitNode->NID);
+                            (*exitNeighbor)->predecessors.insert(kernelNode->NID);
+                        }
+                        else
+                        {
+                            throw AtlasException("Node predecessor not found in the control flow graph!");
                         }
                     }
                 }
-                // now we have to figure out if the
-                // for each neighbor of the kernel exit, change its predecessor to the kernel entrance node
-                for (const auto &neighID : exitNode.neighbors)
-                {
-                    auto neighbor = *(nodes.find(neighID.first));
-                    neighbor->predecessors.erase(exitNode.NID);
-                    neighbor->predecessors.insert(entranceNode->NID);
-                }
-                // remove all nodes within the kernel except the entrance node
-                auto toRemove = kernel->nodes;
-                for (const auto &node : kernel->getEntrances())
-                {
-                    toRemove.erase(node);
-                }
-                for (const auto &node : toRemove)
-                {
-                    RemoveNode(nodes, node);
-                }
-                // finally replace the old entrance node with the new VKNode
-                RemoveNode(nodes, *(kernelEntrances.begin()));
-                nodes.insert(entranceNode);
-                kernel->kernelNode = entranceNode;
-                newPointers.push_back(kernel);
             }
-            else
+            // remove all nodes within the kernel except the entrance node and any virtual kernels within this kernel
+            for (const auto &node : kernel->nodes)
             {
-                throw AtlasException("Kernel ID " + to_string(kernel->KID) + " has " + to_string(kernelEntrances.size()) + " entrances and " + to_string(kernelExits.size()) + " exits!");
+                auto it_Node = nodes.find(node.NID);
+                if (it_Node != nodes.end())
+                {
+                    if (auto VKN = dynamic_cast<VKNode *>(*it_Node))
+                    {
+                        // don't throw away virtual kernel nodes, but disconnect them from the graph
+                        VKN->kernel->parentKernels.insert((uint32_t)kernelNode->NID);
+                        VKN->neighbors.clear();
+                        VKN->predecessors.clear();
+                        continue;
+                    }
+                }
+                else
+                {
+                    throw AtlasException("Could not find kernel member in node graph!");
+                }
+                RemoveNode(nodes, node);
             }
+            // finally replace the old entrance node with the new VKNode
+            nodes.insert(kernelNode);
+            kernel->virtualNode = kernelNode;
+            newPointers.push_back(kernel);
         }
         catch (AtlasException &e)
         {
@@ -982,7 +1256,7 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
     // Annotate its bitcodes and values
-    CleanModule(SourceBitcode.get());
+    //CleanModule(SourceBitcode.get());
     Format(SourceBitcode.get());
     // construct its callgraph
     map<int64_t, BasicBlock *> IDToBlock;
@@ -995,12 +1269,50 @@ int main(int argc, char *argv[])
 
     // Set of nodes that constitute the entire graph
     set<GraphNode *, p_GNCompare> nodes;
+    // maps each block ID to its frequency count (used for performance intrinsics calculations later, must happen before transforms because GraphNodes are 1:1 with blocks)
+    map<int64_t, uint64_t> blockFrequencies;
 
-    ReadBIN(nodes, InputFilename);
-    if (nodes.empty())
+    try
     {
+        auto err = ReadBIN(nodes, InputFilename);
+        if (err)
+        {
+            spdlog::critical("Failed to read input profile file!");
+            return EXIT_FAILURE;
+        }
+        if (nodes.empty())
+        {
+            return EXIT_FAILURE;
+        }
+        // accumulate block frequencies
+        for (const auto &block : nodes)
+        {
+            // we sum along the columns (the probabilities of going to the current node), so we use the edge weight coming from each predecessor to this node
+            for (const auto &pred : block->predecessors)
+            {
+                auto predecessor = nodes.find(pred);
+                // find the edge of the predecessor that goes to the current node
+                for (const auto &nei : (*predecessor)->neighbors)
+                {
+                    if (nei.first == block->NID)
+                    {
+                        // retrieve the edge probability and accumulate it to this node
+                        blockFrequencies[(int64_t)nei.first] += nei.second.first;
+                    }
+                }
+            }
+        }
+    }
+    catch (AtlasException &e)
+    {
+        spdlog::critical(e.what());
         return EXIT_FAILURE;
     }
+
+#ifdef DEBUG
+    spdlog::info("Input control flow graph:");
+    PrintGraph(nodes);
+#endif
 
     // transform graph in an iterative manner until the size of the graph doesn't change
     size_t graphSize = nodes.size();
@@ -1014,19 +1326,33 @@ int main(int argc, char *argv[])
     }
     while (true)
     {
-        // combine all trivial node merges
-        TrivialTransforms(nodes, IDToBlock);
-        // Next transform, find conditional branches and turn them into select statements
-        // In other words, find subgraphs of nodes that have a common entrance and exit, flow from one end to the other, and combine them into a single node
-        BranchToSelectTransforms(nodes);
-        // Finally, transform the graph bottlenecks to avoid multiple entrance/multiple exit kernels
-        FanInFanOutTransform(nodes);
-        if (graphSize == nodes.size())
+        try
         {
-            break;
+            // combine all trivial node merges
+            TrivialTransforms(nodes, IDToBlock);
+            // Next transform, find conditional branches and turn them into select statements
+            // In other words, find subgraphs of nodes that have a common entrance and exit, flow from one end to the other, and combine them into a single node
+            BranchToSelectTransforms(nodes);
+            // Finally, transform the graph bottlenecks to avoid multiple entrance/multiple exit kernels
+            FanInFanOutTransform(nodes);
+            if (graphSize == nodes.size())
+            {
+                break;
+            }
+            graphSize = nodes.size();
         }
-        graphSize = nodes.size();
+        catch (AtlasException &e)
+        {
+            spdlog::critical(e.what());
+            return EXIT_FAILURE;
+        }
     }
+
+#ifdef DEBUG
+    spdlog::info("Transformed Graph:");
+    PrintGraph(nodes);
+#endif
+
     auto endEntropy = EntropyCalculation(nodes);
     auto endTotalEntropy = TotalEntropy(nodes);
     auto endNodes = nodes.size();
@@ -1051,77 +1377,116 @@ int main(int argc, char *argv[])
             auto nodeIDs = Dijkstras(nodes, node->NID, node->NID);
             if (!nodeIDs.empty())
             {
-                auto newKernel = new Kernel();
-                for (const auto &id : nodeIDs)
+                try
                 {
-                    newKernel->nodes.insert(**(nodes.find(id)));
-                }
-                // check for overlap with kernels from this iteration
-                bool overlap = false;
-                // set of kernels that are being kicked out of the newKernels set
-                set<Kernel *, KCompare> toRemove;
-                for (const auto &kern : newKernels)
-                {
-                    auto shared = kern->Compare(*newKernel);
-                    if (shared.size() == kern->getBlocks().size())
+                    // check for cycles within the kernel, if it has more than 1 cycle this kernel will be thrown out
+                    set<set<uint64_t>> cycles;
+                    cycles.insert(set<uint64_t>(nodeIDs.begin(), nodeIDs.end()));
+                    set<GraphNode *, p_GNCompare> kernelGraph;
+                    for (auto &id : nodeIDs)
                     {
-                        // if perfect overlap, this kernel has already been found
-                        overlap = true;
+                        kernelGraph.insert(*(nodes.find(id)));
                     }
-                    if (!shared.empty())
+                    for (const auto &node : kernelGraph)
                     {
-                        // we have an overlap with another kernel, there are two cases that we want to look at
-                        // 1.) shared function
-                        // 2.) kernel hierarchy
-
-                        // First, check for shared function
-                        // two overlapping functions need to satisfy the following condition in order for a shared function to be identified
-                        // 1.) All shared blocks are children of functions that are called within each kernel
-                        // first condition, all shared blocks are children of called functions within the kernel
-                        // set of all functions called in each of the two kernels
-                        set<Function *> calledFunctions;
-                        for (const auto &caller : blockCallers)
+                        auto newCycle = Dijkstras(kernelGraph, node->NID, node->NID);
+                        cycles.insert(set<uint64_t>(newCycle.begin(), newCycle.end()));
+                    }
+                    if (cycles.size() > 1)
+                    {
+                        continue;
+                    }
+                    auto newKernel = new Kernel();
+                    for (const auto &id : nodeIDs)
+                    {
+                        newKernel->nodes.insert(**(nodes.find(id)));
+                    }
+                    // check for overlap with kernels from this iteration
+                    bool overlap = false;
+                    // set of kernels that are being kicked out of the newKernels set
+                    set<Kernel *, KCompare> toRemove;
+                    for (const auto &kern : newKernels)
+                    {
+                        auto shared = kern->Compare(*newKernel);
+                        if (shared.size() == kern->getBlocks().size())
                         {
-                            // only check newKernel because it is the kernel in question
-                            if (newKernel->getBlocks().find(caller.first) != newKernel->getBlocks().end())
-                            {
-                                calledFunctions.insert(IDToBlock[caller.second]->getParent());
-                            }
+                            // if perfect overlap, this kernel has already been found
+                            overlap = true;
                         }
-                        for (const auto &block : shared)
+                        if (!shared.empty())
                         {
-                            if (calledFunctions.find(IDToBlock[block]->getParent()) == calledFunctions.end())
+                            // we have an overlap with another kernel, there are two cases that we want to look at
+                            // 1.) shared function
+                            // 2.) kernel hierarchy
+
+                            // First, check for shared function
+                            // two overlapping functions need to satisfy the following condition in order for a shared function to be identified
+                            // 1.) All shared blocks are children of functions that are called within each kernel
+                            // first condition, all shared blocks are children of called functions within the kernel
+                            // set of all functions called in each of the two kernels
+                            set<Function *> calledFunctions;
+                            for (const auto &caller : blockCallers)
                             {
-                                // this shared block had a parent that was not part of the called functions within the kernel, so mark these two kernels as overlapping
+                                // only check newKernel because it is the kernel in question
+                                if (newKernel->getBlocks().find(caller.first) != newKernel->getBlocks().end())
+                                {
+                                    calledFunctions.insert(IDToBlock[caller.second]->getParent());
+                                }
+                            }
+                            for (const auto &block : shared)
+                            {
+                                if (calledFunctions.find(IDToBlock[block]->getParent()) == calledFunctions.end())
+                                {
+                                    // this shared block had a parent that was not part of the called functions within the kernel, so mark these two kernels as overlapping
+                                    overlap = true;
+                                }
+                            }
+
+                            // Second, compare probability of exit. We will keep the loop that is less probable to exit
+                            if (newKernel->ExitProbability() < kern->ExitProbability())
+                            {
+                                // we keep the new kernel, add the compare kernel to the remove list
+                                toRemove.insert(kern);
+                            }
+                            else
+                            {
                                 overlap = true;
                             }
                         }
-
-                        // Second, compare probability of exit. We will keep the loop that is less probable to exit
-                        if (newKernel->ExitProbability() < kern->ExitProbability())
+                    }
+                    if (!overlap)
+                    {
+                        for (const auto &node : newKernel->nodes)
                         {
-                            // we keep the new kernel, add the compare kernel to the remove list
-                            toRemove.insert(kern);
+                            // we have to get exactly the node from the graph in order to support polymorphism
+                            auto potentialVKN = nodes.find(node.NID);
+                            if (potentialVKN != nodes.end())
+                            {
+                                if (auto VKN = dynamic_cast<VKNode *>(*potentialVKN))
+                                {
+                                    newKernel->childKernels.insert(VKN->kernel->KID);
+                                }
+                            }
+                            else
+                            {
+                                throw AtlasException("Could not find kernel node in the graph!");
+                            }
                         }
-                        else
-                        {
-                            // keep the existing kernel, throw out the new one
-                            overlap = true;
-                        }
+                        newKernels.insert(newKernel);
+                    }
+                    else
+                    {
+                        delete newKernel;
+                    }
+                    for (auto remove : toRemove)
+                    {
+                        newKernels.erase(remove);
+                        delete remove;
                     }
                 }
-                if (!overlap)
+                catch (AtlasException &e)
                 {
-                    newKernels.insert(newKernel);
-                }
-                else
-                {
-                    delete newKernel;
-                }
-                for (auto remove : toRemove)
-                {
-                    newKernels.erase(remove);
-                    delete remove;
+                    spdlog::error(e.what());
                 }
             }
         }
@@ -1141,7 +1506,9 @@ int main(int argc, char *argv[])
             done = true;
         }
     }
+
 #ifdef DEBUG
+    spdlog::info("Resulting DAG:");
     PrintGraph(nodes);
 #endif
 
@@ -1154,7 +1521,7 @@ int main(int argc, char *argv[])
         {
             for (const auto &block : node.blocks)
             {
-                auto infoEntry = blockLabels.find(block.first);
+                auto infoEntry = blockLabels.find(block);
                 if (infoEntry != blockLabels.end())
                 {
                     for (const auto &label : (*infoEntry).second)
@@ -1212,8 +1579,9 @@ int main(int argc, char *argv[])
     outputJson["Entropy"]["End"]["Nodes"] = endNodes;
     outputJson["Entropy"]["End"]["Edges"] = endEdges;
 
-    // sequential ID for each kernel
-    int id = 0;
+    // sequential ID for each kernel and a map from KID to sequential ID
+    uint32_t id = 0;
+    map<uint32_t, uint32_t> SIDMap;
     // average nodes per kernel
     float totalNodes = 0.0;
     // average blocks per kernel
@@ -1232,7 +1600,23 @@ int main(int argc, char *argv[])
         }
         outputJson["Kernels"][to_string(id)]["Labels"] = std::vector<string>();
         outputJson["Kernels"][to_string(id)]["Labels"].push_back(kernel->Label);
+        SIDMap[kernel->KID] = id;
         id++;
+    }
+    // now assign hierarchy to each kernel
+    for (const auto &kern : kernels)
+    {
+        outputJson["Kernels"][to_string(SIDMap[kern->KID])]["Children"] = vector<uint32_t>();
+        outputJson["Kernels"][to_string(SIDMap[kern->KID])]["Parents"] = vector<uint32_t>();
+    }
+    for (const auto &kern : kernels)
+    {
+        // fill in parent category for children while we're filling in the children
+        for (const auto &child : kern->childKernels)
+        {
+            outputJson["Kernels"][to_string(SIDMap[kern->KID])]["Children"].push_back(SIDMap[child]);
+            outputJson["Kernels"][to_string(SIDMap[child])]["Parents"].push_back(SIDMap[kern->KID]);
+        }
     }
     if (!kernels.empty())
     {
@@ -1244,9 +1628,47 @@ int main(int argc, char *argv[])
         outputJson["Average Kernel Size (Nodes)"] = 0.0;
         outputJson["Average Kernel Size (Blocks)"] = 0.0;
     }
+
+    // performance intrinsics
+    map<string, set<int64_t>> kernelBlockSets;
+    for (const auto &kernel : outputJson["Kernels"].items())
+    {
+        if (outputJson["Kernels"].find(kernel.key()) != outputJson["Kernels"].end())
+        {
+            if (outputJson["Kernels"][kernel.key()].find("Blocks") != outputJson["Kernels"][kernel.key()].end())
+            {
+                auto blockSet = outputJson["Kernels"][kernel.key()]["Blocks"].get<set<int64_t>>();
+                kernelBlockSets[kernel.key()] = blockSet;
+            }
+        }
+    }
+
+    auto prof = ProfileKernels(kernelBlockSets, SourceBitcode.get(), blockFrequencies);
+    for (const auto &kernelID : prof)
+    {
+        outputJson["Kernels"][kernelID.first]["Performance Intrinsics"] = kernelID.second;
+    }
     ofstream oStream(OutputFilename);
     oStream << setw(4) << outputJson;
     oStream.close();
+    if (!DotFile.empty())
+    {
+        ofstream dStream(DotFile);
+        auto graph = GenerateDot(nodes, kernels);
+        dStream << graph << "\n";
+        dStream.close();
+    }
+
+    // free kernel set and nodes
+
+    /*for (const auto node : nodes)
+    {
+        RemoveNode(nodes, node);
+    }*/
+    for (const auto &kern : kernels)
+    {
+        delete kern;
+    }
     return 0;
 }
 

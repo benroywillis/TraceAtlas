@@ -1,4 +1,5 @@
 #include "Kernel.h"
+#include "AtlasUtil/Exceptions.h"
 #include "Dijkstra.h"
 
 using namespace std;
@@ -10,6 +11,8 @@ Kernel::Kernel()
 {
     KID = getNextKID();
     nodes = std::set<GraphNode, GNCompare>();
+    childKernels = std::set<uint32_t>();
+    parentKernels = std::set<uint32_t>();
     Label = "";
 }
 
@@ -17,6 +20,8 @@ Kernel::Kernel(uint32_t ID)
 {
     KID = ID;
     nodes = std::set<GraphNode, GNCompare>();
+    childKernels = std::set<uint32_t>();
+    parentKernels = std::set<uint32_t>();
     Label = "";
 }
 
@@ -40,10 +45,35 @@ std::vector<GraphNode> Kernel::getEntrances() const
     return entrances;
 }
 
+/// Returns the IDs of the kernel entrances
+/// @retval    entrances Vector of IDs that specify which nodes (or blocks) are the kernel entrances. Kernel entrances are the source nodes of edges that enter the kernel
+std::vector<GraphNode *> Kernel::getEntrances(std::set<GraphNode *, p_GNCompare> &CFG) const
+{
+    std::vector<GraphNode *> entrances;
+    for (const auto &node : nodes)
+    {
+        for (const auto &pred : node.predecessors)
+        {
+            if (nodes.find(pred) == nodes.end())
+            {
+                // this node has a predecessor outside of the kernel, so it is considered an entrance node
+                auto nodeIt = CFG.find(node.NID);
+                if (nodeIt == CFG.end())
+                {
+                    throw AtlasException("Could not find kernel entrance in control flow graph!");
+                }
+                entrances.push_back(*nodeIt);
+                break;
+            }
+        }
+    }
+    return entrances;
+}
+
 /// @brief Returns the IDs of the kernel exits
 ///
 /// @param[in] allNodes Set of all nodes in the control flow graph. Used to copy the nodes that are the destinations of edges that leave the kernel
-/// @retval    exits Vector of IDs that specify which nodes (or blocks) are the kernel exits. Kernel exits are nodes that have a neighbor outside the kernel
+/// @retval    exits    Vector of IDs that specify which nodes (or blocks) are the kernel exits. Kernel exits are nodes that have a neighbor outside the kernel
 std::vector<GraphNode> Kernel::getExits() const
 {
     std::vector<GraphNode> exitNodes;
@@ -61,16 +91,34 @@ std::vector<GraphNode> Kernel::getExits() const
     return exitNodes;
 }
 
+std::vector<GraphNode *> Kernel::getExits(std::set<GraphNode *, p_GNCompare> &CFG) const
+{
+    std::vector<GraphNode *> exitNodes;
+    for (const auto &node : nodes)
+    {
+        for (const auto &neighbor : node.neighbors)
+        {
+            if (nodes.find(neighbor.first) == nodes.end())
+            {
+                // we've found an exit
+                auto nodeIt = CFG.find(node.NID);
+                if (nodeIt == CFG.end())
+                {
+                    throw AtlasException("Could not find kernel entrance in control flow graph!");
+                }
+                exitNodes.push_back(*nodeIt);
+            }
+        }
+    }
+    return exitNodes;
+}
 /// @brief Returns the member blocks (from the source bitcode) of this kernel
 std::set<int64_t> Kernel::getBlocks() const
 {
     std::set<int64_t> blocks;
     for (const auto &node : nodes)
     {
-        for (const auto &block : node.blocks)
-        {
-            blocks.insert(block.first);
-        }
+        blocks.insert(node.blocks.begin(), node.blocks.end());
     }
     return blocks;
 }
@@ -88,10 +136,7 @@ std::set<int64_t> Kernel::Compare(const Kernel &compare) const
     {
         if (nodes.find(compNode) != nodes.end())
         {
-            for (const auto &block : compNode.blocks)
-            {
-                shared.insert(block.first);
-            }
+            shared.insert(compNode.blocks.begin(), compNode.blocks.end());
         }
     }
     return shared;
